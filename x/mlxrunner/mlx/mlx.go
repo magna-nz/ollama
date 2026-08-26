@@ -1,3 +1,8 @@
+// Package mlx wraps the MLX C API.
+//
+// MLX keeps stream and backend state in thread-locals, so all calls into this
+// package must come from a single goroutine locked to its OS thread (see
+// internal/mlxthread).
 package mlx
 
 //go:generate go run generator/main.go -output=. ./include/mlx/c/*.h
@@ -9,8 +14,8 @@ package mlx
 // #include "generated.h"
 // #include <string.h>
 //
-// static __thread char _mlx_last_error_msg[1024] = {0};
-// static __thread int  _mlx_last_error_flag = 0;
+// static char _mlx_last_error_msg[1024] = {0};
+// static int  _mlx_last_error_flag = 0;
 //
 // static void _mlx_capture_error_handler(const char* msg, void* data) {
 //     (void)data;
@@ -37,7 +42,6 @@ import "C"
 
 import (
 	"fmt"
-	"runtime"
 )
 
 func init() {
@@ -46,37 +50,31 @@ func init() {
 	C.mlx_install_capture_handler()
 }
 
+// lastError consumes the captured MLX error, or returns nil when none is
+// pending.
+func lastError() error {
+	msg := C.GoString(C.mlx_get_last_error())
+	if msg == "" {
+		return nil
+	}
+	C.mlx_clear_last_error()
+	return fmt.Errorf("mlx: %s", msg)
+}
+
+// mlxCheck panics with the captured MLX error if a call failed. Most array
+// operations cannot recover from a failed graph construction or evaluation.
+func mlxCheck(ret C.int) {
+	if ret != 0 {
+		panic(lastError())
+	}
+}
+
 // Version returns the MLX core library version string.
 func Version() string {
 	str := C.mlx_string_new()
 	defer C.mlx_string_free(str)
 	C.mlx_version(&str)
 	return C.GoString(C.mlx_string_data(str))
-}
-
-// mlxCall locks the goroutine to its OS thread so the thread-local error state
-// is read from the same thread that executed fn.
-func mlxCall(fallback string, fn func() C.int) error {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	C.mlx_clear_last_error()
-	if fn() != 0 {
-		msg := C.GoString(C.mlx_get_last_error())
-		if msg == "" {
-			msg = fallback
-		}
-		return fmt.Errorf("mlx: %s", msg)
-	}
-	return nil
-}
-
-// mlxCheck panics with the captured MLX error. Most array operations cannot
-// recover from a failed graph construction or evaluation.
-func mlxCheck(fallback string, fn func() C.int) {
-	if err := mlxCall(fallback, fn); err != nil {
-		panic(err.Error())
-	}
 }
 
 func doEval(outputs []*Array, async bool) {
@@ -93,12 +91,11 @@ func doEval(outputs []*Array, async bool) {
 		}
 	}
 
-	mlxCheck("eval failed", func() C.int {
-		if async {
-			return C.mlx_async_eval(vector)
-		}
-		return C.mlx_eval(vector)
-	})
+	if async {
+		mlxCheck(C.mlx_async_eval(vector))
+	} else {
+		mlxCheck(C.mlx_eval(vector))
+	}
 }
 
 func AsyncEval(outputs ...*Array) {
