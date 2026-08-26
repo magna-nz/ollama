@@ -48,31 +48,31 @@ func PrettyBytes(n int) fmt.Stringer {
 
 func ActiveMemory() int {
 	var active C.size_t
-	C.mlx_get_active_memory(&active)
+	mlxCheck(C.mlx_get_active_memory(&active))
 	return int(active)
 }
 
 func CacheMemory() int {
 	var cache C.size_t
-	C.mlx_get_cache_memory(&cache)
+	mlxCheck(C.mlx_get_cache_memory(&cache))
 	return int(cache)
 }
 
 func PeakMemory() int {
 	var peak C.size_t
-	C.mlx_get_peak_memory(&peak)
+	mlxCheck(C.mlx_get_peak_memory(&peak))
 	return int(peak)
 }
 
 func ResetPeakMemory() {
-	C.mlx_reset_peak_memory()
+	mlxCheck(C.mlx_reset_peak_memory())
 }
 
 // MaxRecommendedWorkingSetSize returns the device's recommended upper bound
 // for resident Metal allocations.
 func MaxRecommendedWorkingSetSize() (int, error) {
 	info := C.mlx_device_info_new()
-	defer C.mlx_device_info_free(info)
+	defer func() { mlxCheck(C.mlx_device_info_free(info)) }()
 	if C.mlx_device_info_get(&info, DefaultDevice().ctx) != 0 {
 		return 0, lastError()
 	}
@@ -120,5 +120,5 @@ type (
 )
 
 func ClearCache() {
-	C.mlx_clear_cache()
+	mlxCheck(C.mlx_clear_cache())
 }

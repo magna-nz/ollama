@@ -69,23 +69,21 @@ type gpuLaunch struct {
 	inputs      []*Array
 }
 
-func cStringVector(values []string) (C.mlx_vector_string, func(), bool) {
+func cStringVector(values []string) (C.mlx_vector_string, func(), error) {
 	vec := C.mlx_vector_string_new()
-	ok := true
 	for _, s := range values {
 		cs := C.CString(s)
-		if C.mlx_vector_string_append_value(vec, cs) != 0 {
-			ok = false
-		}
+		rc := C.mlx_vector_string_append_value(vec, cs)
 		C.free(unsafe.Pointer(cs))
-		if !ok {
-			break
+		if rc != 0 {
+			mlxCheck(C.mlx_vector_string_free(vec))
+			return vec, nil, lastError()
 		}
 	}
 	cleanup := func() {
-		C.mlx_vector_string_free(vec)
+		mlxCheck(C.mlx_vector_string_free(vec))
 	}
-	return vec, cleanup, ok
+	return vec, cleanup, nil
 }
 
 // run executes the kernel with the first backend that works, in CUDA,
@@ -107,14 +105,22 @@ func (k *gpuKernel) run(launch gpuLaunch) []*Array {
 	return outs
 }
 
-func (k *gpuKernel) disableMetal(reason string) {
+func (k *gpuKernel) disableMetal(reason string, err error) {
 	k.metalDisabled = true
-	slog.Warn("custom GPU kernel backend disabled", "kernel", k.name, "backend", "metal", "reason", reason)
+	args := []any{"kernel", k.name, "backend", "metal", "reason", reason}
+	if err != nil {
+		args = append(args, "error", err)
+	}
+	slog.Warn("custom GPU kernel backend disabled", args...)
 }
 
-func (k *gpuKernel) disableCUDA(reason string) {
+func (k *gpuKernel) disableCUDA(reason string, err error) {
 	k.cudaDisabled = true
-	slog.Warn("custom GPU kernel backend disabled", "kernel", k.name, "backend", "cuda", "reason", reason)
+	args := []any{"kernel", k.name, "backend", "cuda", "reason", reason}
+	if err != nil {
+		args = append(args, "error", err)
+	}
+	slog.Warn("custom GPU kernel backend disabled", args...)
 }
 
 func (k *gpuKernel) getMetal() (C.mlx_fast_metal_kernel, bool) {
@@ -125,22 +131,20 @@ func (k *gpuKernel) getMetal() (C.mlx_fast_metal_kernel, bool) {
 		}
 
 		if k.metal.source == "" {
-			k.disableMetal("no source")
+			k.disableMetal("no source", nil)
 			return
 		}
 
-		inputs, freeInputs, ok := cStringVector(k.inputs)
-		if !ok {
-			freeInputs()
-			k.disableMetal("creating input names failed")
+		inputs, freeInputs, err := cStringVector(k.inputs)
+		if err != nil {
+			k.disableMetal("creating input names failed", err)
 			return
 		}
 		defer freeInputs()
 
-		outputs, freeOutputs, ok := cStringVector(k.outputs)
-		if !ok {
-			freeOutputs()
-			k.disableMetal("creating output names failed")
+		outputs, freeOutputs, err := cStringVector(k.outputs)
+		if err != nil {
+			k.disableMetal("creating output names failed", err)
 			return
 		}
 		defer freeOutputs()
@@ -163,7 +167,7 @@ func (k *gpuKernel) getMetal() (C.mlx_fast_metal_kernel, bool) {
 			C.bool(false),
 		)
 		if k.metalKernel.ctx == nil {
-			k.disableMetal("creating kernel failed")
+			k.disableMetal("creating kernel failed", lastError())
 		}
 	})
 	return k.metalKernel, !k.metalDisabled
@@ -180,12 +184,16 @@ func (k *gpuKernel) applyMetal(launch gpuLaunch) ([]*Array, bool) {
 
 	cfg := C.mlx_fast_metal_kernel_config_new()
 	defer C.mlx_fast_metal_kernel_config_free(cfg)
+	if cfg.ctx == nil {
+		k.disableMetal("creating config failed", lastError())
+		return nil, false
+	}
 	for _, arg := range launch.dtypes {
 		name := C.CString(arg.name)
 		rc := C.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, name, C.mlx_dtype(arg.dtype))
 		C.free(unsafe.Pointer(name))
 		if rc != 0 {
-			k.disableMetal("setting dtype template arg failed")
+			k.disableMetal("setting dtype template arg failed", lastError())
 			return nil, false
 		}
 	}
@@ -194,7 +202,7 @@ func (k *gpuKernel) applyMetal(launch gpuLaunch) ([]*Array, bool) {
 		rc := C.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, name, C.int(arg.value))
 		C.free(unsafe.Pointer(name))
 		if rc != 0 {
-			k.disableMetal("setting int template arg failed")
+			k.disableMetal("setting int template arg failed", lastError())
 			return nil, false
 		}
 	}
@@ -204,13 +212,13 @@ func (k *gpuKernel) applyMetal(launch gpuLaunch) ([]*Array, bool) {
 			shape[i] = C.int(d)
 		}
 		if C.mlx_fast_metal_kernel_config_add_output_arg(cfg, unsafe.SliceData(shape), C.size_t(len(shape)), C.mlx_dtype(out.dtype)) != 0 {
-			k.disableMetal("adding output failed")
+			k.disableMetal("adding output failed", lastError())
 			return nil, false
 		}
 	}
 	if C.mlx_fast_metal_kernel_config_set_grid(cfg, C.int(launch.grid[0]), C.int(launch.grid[1]), C.int(launch.grid[2])) != 0 ||
 		C.mlx_fast_metal_kernel_config_set_thread_group(cfg, C.int(launch.threadGroup[0]), C.int(launch.threadGroup[1]), C.int(launch.threadGroup[2])) != 0 {
-		k.disableMetal("setting grid failed")
+		k.disableMetal("setting grid failed", lastError())
 		return nil, false
 	}
 
@@ -219,11 +227,15 @@ func (k *gpuKernel) applyMetal(launch gpuLaunch) ([]*Array, bool) {
 		inputs[i] = in.ctx
 	}
 	inVec := C.mlx_vector_array_new_data(unsafe.SliceData(inputs), C.size_t(len(inputs)))
-	defer C.mlx_vector_array_free(inVec)
+	if inVec.ctx == nil {
+		k.disableMetal("creating input vector failed", lastError())
+		return nil, false
+	}
+	defer freeVectorArray(inVec)
 	outVec := C.mlx_vector_array_new()
-	defer C.mlx_vector_array_free(outVec)
+	defer freeVectorArray(outVec)
 	if C.mlx_fast_metal_kernel_apply(&outVec, kernel, inVec, cfg, DefaultStream().ctx) != 0 {
-		k.disableMetal("launching failed")
+		k.disableMetal("launching failed", lastError())
 		return nil, false
 	}
 	if int(C.mlx_vector_array_size(outVec)) < len(launch.outputs) {
@@ -233,7 +245,7 @@ func (k *gpuKernel) applyMetal(launch gpuLaunch) ([]*Array, bool) {
 	outs := make([]*Array, len(launch.outputs))
 	for i, out := range launch.outputs {
 		outs[i] = New(out.name)
-		C.mlx_vector_array_get(&outs[i].ctx, outVec, C.size_t(i))
+		mlxCheck(C.mlx_vector_array_get(&outs[i].ctx, outVec, C.size_t(i)))
 	}
 	return outs, true
 }
@@ -246,22 +258,20 @@ func (k *gpuKernel) getCUDA() (C.mlx_fast_cuda_kernel, bool) {
 		}
 
 		if k.cuda.source == "" {
-			k.disableCUDA("no source")
+			k.disableCUDA("no source", nil)
 			return
 		}
 
-		inputs, freeInputs, ok := cStringVector(k.inputs)
-		if !ok {
-			freeInputs()
-			k.disableCUDA("creating input names failed")
+		inputs, freeInputs, err := cStringVector(k.inputs)
+		if err != nil {
+			k.disableCUDA("creating input names failed", err)
 			return
 		}
 		defer freeInputs()
 
-		outputs, freeOutputs, ok := cStringVector(k.outputs)
-		if !ok {
-			freeOutputs()
-			k.disableCUDA("creating output names failed")
+		outputs, freeOutputs, err := cStringVector(k.outputs)
+		if err != nil {
+			k.disableCUDA("creating output names failed", err)
 			return
 		}
 		defer freeOutputs()
@@ -283,7 +293,7 @@ func (k *gpuKernel) getCUDA() (C.mlx_fast_cuda_kernel, bool) {
 			C.int(0),
 		)
 		if k.cudaKernel.ctx == nil {
-			k.disableCUDA("creating kernel failed")
+			k.disableCUDA("creating kernel failed", lastError())
 		}
 	})
 	return k.cudaKernel, !k.cudaDisabled
@@ -300,12 +310,16 @@ func (k *gpuKernel) applyCUDA(launch gpuLaunch) ([]*Array, bool) {
 
 	cfg := C.mlx_fast_cuda_kernel_config_new()
 	defer C.mlx_fast_cuda_kernel_config_free(cfg)
+	if cfg.ctx == nil {
+		k.disableCUDA("creating config failed", lastError())
+		return nil, false
+	}
 	for _, arg := range launch.dtypes {
 		name := C.CString(arg.name)
 		rc := C.mlx_fast_cuda_kernel_config_add_template_arg_dtype(cfg, name, C.mlx_dtype(arg.dtype))
 		C.free(unsafe.Pointer(name))
 		if rc != 0 {
-			k.disableCUDA("setting dtype template arg failed")
+			k.disableCUDA("setting dtype template arg failed", lastError())
 			return nil, false
 		}
 	}
@@ -314,7 +328,7 @@ func (k *gpuKernel) applyCUDA(launch gpuLaunch) ([]*Array, bool) {
 		rc := C.mlx_fast_cuda_kernel_config_add_template_arg_int(cfg, name, C.int(arg.value))
 		C.free(unsafe.Pointer(name))
 		if rc != 0 {
-			k.disableCUDA("setting int template arg failed")
+			k.disableCUDA("setting int template arg failed", lastError())
 			return nil, false
 		}
 	}
@@ -324,13 +338,13 @@ func (k *gpuKernel) applyCUDA(launch gpuLaunch) ([]*Array, bool) {
 			shape[i] = C.int(d)
 		}
 		if C.mlx_fast_cuda_kernel_config_add_output_arg(cfg, unsafe.SliceData(shape), C.size_t(len(shape)), C.mlx_dtype(out.dtype)) != 0 {
-			k.disableCUDA("adding output failed")
+			k.disableCUDA("adding output failed", lastError())
 			return nil, false
 		}
 	}
 	if C.mlx_fast_cuda_kernel_config_set_grid(cfg, C.int(launch.grid[0]), C.int(launch.grid[1]), C.int(launch.grid[2])) != 0 ||
 		C.mlx_fast_cuda_kernel_config_set_thread_group(cfg, C.int(launch.threadGroup[0]), C.int(launch.threadGroup[1]), C.int(launch.threadGroup[2])) != 0 {
-		k.disableCUDA("setting grid failed")
+		k.disableCUDA("setting grid failed", lastError())
 		return nil, false
 	}
 
@@ -339,11 +353,15 @@ func (k *gpuKernel) applyCUDA(launch gpuLaunch) ([]*Array, bool) {
 		inputs[i] = in.ctx
 	}
 	inVec := C.mlx_vector_array_new_data(unsafe.SliceData(inputs), C.size_t(len(inputs)))
-	defer C.mlx_vector_array_free(inVec)
+	if inVec.ctx == nil {
+		k.disableCUDA("creating input vector failed", lastError())
+		return nil, false
+	}
+	defer freeVectorArray(inVec)
 	outVec := C.mlx_vector_array_new()
-	defer C.mlx_vector_array_free(outVec)
+	defer freeVectorArray(outVec)
 	if C.mlx_fast_cuda_kernel_apply(&outVec, kernel, inVec, cfg, DefaultStream().ctx) != 0 {
-		k.disableCUDA("launching failed")
+		k.disableCUDA("launching failed", lastError())
 		return nil, false
 	}
 	if int(C.mlx_vector_array_size(outVec)) < len(launch.outputs) {
@@ -353,7 +371,7 @@ func (k *gpuKernel) applyCUDA(launch gpuLaunch) ([]*Array, bool) {
 	outs := make([]*Array, len(launch.outputs))
 	for i, out := range launch.outputs {
 		outs[i] = New(out.name)
-		C.mlx_vector_array_get(&outs[i].ctx, outVec, C.size_t(i))
+		mlxCheck(C.mlx_vector_array_get(&outs[i].ctx, outVec, C.size_t(i)))
 	}
 	return outs, true
 }

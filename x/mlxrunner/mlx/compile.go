@@ -60,27 +60,30 @@ func Compile(name string, fn CompileFunc, opts ...CompileOption) CompileFunc {
 				unsafe.Pointer(payload),
 				(*[0]byte)(C.closureDestructor),
 			)
-			defer C.mlx_closure_free(src)
+			if src.ctx == nil {
+				panic(lastError())
+			}
+			defer freeClosure(src)
 
 			closure = C.mlx_closure_new()
 			mlxCheck(C.mlx_compile(&closure, src, C.bool(cfg.shapeless)))
 		})
 
 		inVec := C.mlx_vector_array_new()
-		defer C.mlx_vector_array_free(inVec)
+		defer freeVectorArray(inVec)
 		for _, in := range inputs {
-			C.mlx_vector_array_append_value(inVec, in.ctx)
+			mlxCheck(C.mlx_vector_array_append_value(inVec, in.ctx))
 		}
 
 		outVec := C.mlx_vector_array_new()
-		defer C.mlx_vector_array_free(outVec)
+		defer freeVectorArray(outVec)
 		mlxCheck(C.mlx_closure_apply(&outVec, closure, inVec))
 
 		n := int(C.mlx_vector_array_size(outVec))
 		outputs := make([]*Array, n)
 		for i := range n {
 			outputs[i] = New(name)
-			C.mlx_vector_array_get(&outputs[i].ctx, outVec, C.size_t(i))
+			mlxCheck(C.mlx_vector_array_get(&outputs[i].ctx, outVec, C.size_t(i)))
 		}
 		return outputs
 	}
@@ -150,7 +153,7 @@ func closureCallback(res *C.mlx_vector_array, input C.mlx_vector_array, payload 
 				panic("mlx: traced array was pinned during compilation")
 			}
 			if a.Valid() {
-				C.mlx_array_free(a.ctx)
+				mlxCheck(C.mlx_array_free(a.ctx))
 				a.ctx.ctx = nil
 			}
 		}
@@ -162,7 +165,7 @@ func closureCallback(res *C.mlx_vector_array, input C.mlx_vector_array, payload 
 	inputs := make([]*Array, n)
 	for i := range n {
 		a := New("")
-		C.mlx_vector_array_get(&a.ctx, input, C.size_t(i))
+		mlxCheck(C.mlx_vector_array_get(&a.ctx, input, C.size_t(i)))
 		inputs[i] = a
 	}
 
@@ -176,7 +179,7 @@ func closureCallback(res *C.mlx_vector_array, input C.mlx_vector_array, payload 
 		}
 		arrPtr = &handles[0]
 	}
-	C.mlx_vector_array_set_data(res, arrPtr, C.size_t(len(outputs)))
+	mlxCheck(C.mlx_vector_array_set_data(res, arrPtr, C.size_t(len(outputs))))
 	return 0
 }
 

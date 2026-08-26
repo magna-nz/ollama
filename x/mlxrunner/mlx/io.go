@@ -33,10 +33,13 @@ func LoadSafetensorsNative(path string) (*SafetensorsFile, error) {
 	defer C.free(unsafe.Pointer(cPath))
 
 	stream := loadSafetensorsStream()
-	defer C.mlx_stream_free(stream)
+	if stream.ctx == nil {
+		return nil, lastError()
+	}
+	defer freeStream(stream)
 
 	if C.mlx_load_safetensors(&arrays, &metadata, cPath, stream) != 0 {
-		return nil, fmt.Errorf("failed to load safetensors: %s", path)
+		return nil, fmt.Errorf("failed to load safetensors %s: %w", path, lastError())
 	}
 
 	return &SafetensorsFile{arrays: arrays, metadata: metadata}, nil
@@ -49,6 +52,9 @@ func (s *SafetensorsFile) Get(name string) *Array {
 
 	value := C.mlx_array_new()
 	if C.mlx_map_string_to_array_get(&value, s.arrays, cName) != 0 {
+		if err := lastError(); err != nil {
+			panic(err)
+		}
 		return nil
 	}
 	if value.ctx == nil {
@@ -67,6 +73,9 @@ func (s *SafetensorsFile) GetMetadata(key string) string {
 
 	var cValue *C.char
 	if C.mlx_map_string_to_string_get(&cValue, s.metadata, cKey) != 0 {
+		if err := lastError(); err != nil {
+			panic(err)
+		}
 		return ""
 	}
 	return C.GoString(cValue)
@@ -77,8 +86,8 @@ func (s *SafetensorsFile) Free() {
 	if s == nil {
 		return
 	}
-	C.mlx_map_string_to_array_free(s.arrays)
-	C.mlx_map_string_to_string_free(s.metadata)
+	mlxCheck(C.mlx_map_string_to_array_free(s.arrays))
+	mlxCheck(C.mlx_map_string_to_string_free(s.metadata))
 }
 
 func Load(path string) iter.Seq2[string, *Array] {
@@ -90,12 +99,15 @@ func Load(path string) iter.Seq2[string, *Array] {
 		defer sf.Free()
 
 		it := C.mlx_map_string_to_array_iterator_new(sf.arrays)
-		defer C.mlx_map_string_to_array_iterator_free(it)
+		defer func() { mlxCheck(C.mlx_map_string_to_array_iterator_free(it)) }()
 
 		for {
 			var key *C.char
 			value := C.mlx_array_new()
 			if C.mlx_map_string_to_array_iterator_next(&key, &value, it) != 0 {
+				if err := lastError(); err != nil {
+					panic(err)
+				}
 				break
 			}
 
@@ -120,7 +132,7 @@ func SaveSafetensorsWithMetadata(path string, arrays map[string]*Array, metadata
 	defer C.free(unsafe.Pointer(cPath))
 
 	cArrays := C.mlx_map_string_to_array_new()
-	defer C.mlx_map_string_to_array_free(cArrays)
+	defer func() { mlxCheck(C.mlx_map_string_to_array_free(cArrays)) }()
 
 	arrayNames := make([]string, 0, len(arrays))
 	for name, arr := range arrays {
@@ -134,12 +146,12 @@ func SaveSafetensorsWithMetadata(path string, arrays map[string]*Array, metadata
 	for _, name := range arrayNames {
 		arr := arrays[name]
 		cName := C.CString(name)
-		C.mlx_map_string_to_array_insert(cArrays, cName, arr.ctx)
+		mlxCheck(C.mlx_map_string_to_array_insert(cArrays, cName, arr.ctx))
 		C.free(unsafe.Pointer(cName))
 	}
 
 	cMetadata := C.mlx_map_string_to_string_new()
-	defer C.mlx_map_string_to_string_free(cMetadata)
+	defer func() { mlxCheck(C.mlx_map_string_to_string_free(cMetadata)) }()
 
 	metadataKeys := make([]string, 0, len(metadata))
 	for key := range metadata {
@@ -151,13 +163,13 @@ func SaveSafetensorsWithMetadata(path string, arrays map[string]*Array, metadata
 		value := metadata[key]
 		cKey := C.CString(key)
 		cValue := C.CString(value)
-		C.mlx_map_string_to_string_insert(cMetadata, cKey, cValue)
+		mlxCheck(C.mlx_map_string_to_string_insert(cMetadata, cKey, cValue))
 		C.free(unsafe.Pointer(cKey))
 		C.free(unsafe.Pointer(cValue))
 	}
 
 	if C.mlx_save_safetensors(cPath, cArrays, cMetadata) != 0 {
-		return fmt.Errorf("failed to save safetensors: %s", path)
+		return fmt.Errorf("failed to save safetensors %s: %w", path, lastError())
 	}
 
 	return nil

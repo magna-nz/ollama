@@ -69,11 +69,20 @@ func mlxCheck(ret C.int) {
 	}
 }
 
+// Deferred frees go through these helpers: defer evaluates a call's
+// arguments immediately, so defer mlxCheck(C.mlx_..._free(v)) would
+// free v on the spot and defer only the check.
+func freeString(s C.mlx_string)            { mlxCheck(C.mlx_string_free(s)) }
+func freeVectorArray(v C.mlx_vector_array) { mlxCheck(C.mlx_vector_array_free(v)) }
+func freeClosure(c C.mlx_closure)          { mlxCheck(C.mlx_closure_free(c)) }
+func freeStream(s C.mlx_stream)            { mlxCheck(C.mlx_stream_free(s)) }
+func freeDevice(d C.mlx_device)            { mlxCheck(C.mlx_device_free(d)) }
+
 // Version returns the MLX core library version string.
 func Version() string {
 	str := C.mlx_string_new()
-	defer C.mlx_string_free(str)
-	C.mlx_version(&str)
+	defer freeString(str)
+	mlxCheck(C.mlx_version(&str))
 	return C.GoString(C.mlx_string_data(str))
 }
 
@@ -83,11 +92,11 @@ func doEval(outputs []*Array, async bool) {
 	}
 
 	vector := C.mlx_vector_array_new()
-	defer C.mlx_vector_array_free(vector)
+	defer freeVectorArray(vector)
 
 	for _, output := range outputs {
 		if output != nil && output.Valid() {
-			C.mlx_vector_array_append_value(vector, output.ctx)
+			mlxCheck(C.mlx_vector_array_append_value(vector, output.ctx))
 		}
 	}
 
@@ -109,13 +118,13 @@ func Eval(outputs ...*Array) {
 // MetalIsAvailable returns true if a Metal GPU is available.
 func MetalIsAvailable() bool {
 	var available C._Bool
-	C.mlx_metal_is_available(&available)
+	mlxCheck(C.mlx_metal_is_available(&available))
 	return bool(available)
 }
 
 // CUDAIsAvailable returns true if a CUDA GPU is available.
 func CUDAIsAvailable() bool {
 	var available C._Bool
-	C.mlx_cuda_is_available(&available)
+	mlxCheck(C.mlx_cuda_is_available(&available))
 	return bool(available)
 }
